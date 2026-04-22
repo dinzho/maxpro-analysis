@@ -2,11 +2,12 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import datetime
 import time
+from functools import wraps
 import plotly.graph_objects as go
-from datetime import datetime
 
-# === 頁面配置與樣式 ===
+# === 1. 頁面配置 ===
 st.set_page_config(page_title="股票深度分析報告", page_icon="📊", layout="wide")
 st.markdown("""
     <style>
@@ -19,15 +20,15 @@ st.markdown("""
     .metric-value { font-size: 1.1rem; font-weight: 600; color: #111827; }
     .tag-green { color: #059669; font-weight: 600; }
     .tag-red { color: #dc2626; font-weight: 600; }
+    .tag-orange { color: #d97706; font-weight: 600; }
     hr { border-top: 1px solid #e5e7eb; margin: 20px 0; }
     #MainMenu, footer, header { visibility: hidden; }
     </style>
 """, unsafe_allow_html=True)
 
-# === 緩存與數據獲取（抗限流強化） ===
+# === 2. 緩存與數據獲取（抗限流+型別安全） ===
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_market_context():
-    """獨立獲取大盤與情緒指標，避免與個股請求衝突"""
     try:
         vix = yf.Ticker("^VIX").history(period="1d", interval="1d")
         time.sleep(0.8)
@@ -35,49 +36,40 @@ def get_market_context():
         vix_val = vix['Close'].iloc[-1] if not vix.empty else 20
         spy_chg = ((spy['Close'].iloc[-1] - spy['Close'].iloc[-2]) / spy['Close'].iloc[-2]) * 100 if len(spy) >= 2 else 0
         return vix_val, spy_chg
-    except:
-        return 20, 0
+    except: return 20, 0
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_stock_data(ticker):
-    """帶重試機制的穩健數據獲取"""
     try:
         stock = yf.Ticker(ticker)
         df = stock.history(period="2y", interval="1d")
         time.sleep(0.6)
+        if df.empty or len(df) < 30: return None, None, "數據不足或代碼錯誤"
         
-        if df.empty or len(df) < 30:
-            return None, None, None, None, "數據不足或代碼錯誤"
-            
-        # 清理欄位名
         df.columns = [str(c).lower().split('_')[0] for c in df.columns]
-        if 'close' not in df.columns:
-            return None, None, None, None, "無法解析收盤價欄位"
-            
-        # 基本面獲取（帶重試）
+        if 'close' not in df.columns: return None, None, "無法解析收盤價欄位"
+        
         info = {}
         for attempt in range(3):
             try:
                 info = stock.info
                 if info and 'sector' in info: break
                 time.sleep(1.5 * (attempt + 1))
-            except Exception:
-                time.sleep(2 ** attempt)
-                
+            except Exception: time.sleep(2 ** attempt)
+            
         news_data = []
         try:
             time.sleep(0.5)
             news_data = getattr(stock, 'news', []) or []
         except: pass
-            
-        return df, info, news_data, None
+        return df, info, None
     except Exception as e:
         err = str(e)
         if "Too Many Requests" in err or "Rate limited" in err:
-            return None, None, None, "⚠️ Yahoo Finance 請求過於頻繁，請稍候 1~2 分鐘後點擊下方「重試」按鈕。"
-        return None, None, None, f"數據獲取失敗：{err}"
+            return None, None, "⚠️ Yahoo Finance 請求過於頻繁，請稍候 1~2 分鐘後重試。"
+        return None, None, f"數據獲取失敗：{err}"
 
-# === 技術指標計算 ===
+# === 3. 技術指標計算 ===
 @st.cache_data
 def calc_indicators(df):
     df = df.copy()
@@ -96,7 +88,7 @@ def calc_indicators(df):
     df['SMA200'] = df['close'].rolling(200, min_periods=1).mean()
     return df
 
-# === 圖表生成 ===
+# === 4. 圖表生成 ===
 def generate_chart(df, fib_levels):
     plot_df = df.tail(252).copy()
     if plot_df.empty: return None
@@ -119,7 +111,7 @@ def generate_chart(df, fib_levels):
     fig.update_yaxes(showgrid=True, gridcolor='#e5e7eb', gridwidth=0.5)
     return fig
 
-# === 市場情緒與行業分析 ===
+# === 5. 市場情緒與行業分析 ===
 def get_sentiment(df, current_price, sma20, vix_val, spy_chg):
     tech = "🟢 多頭" if current_price > sma20.iloc[-1] else "🔴 空頭"
     vol = df['volume'].iloc[-1]
@@ -153,21 +145,28 @@ def analyze_industry(sector, industry, gross_margin, roe):
         return "資金密集型", "服務中介", "弱勢 (資金成本)", "中等"
     return "一般行業", "中游", "中等", "中等"
 
-# === 主程序 ===
+# === 🔑 核心修復：安全數值提取器 (防 TypeError) ===
+def safe_float(key, info_dict, default=0.0):
+    v = info_dict.get(key)
+    if v is None or pd.isna(v): return default
+    try: return float(v)
+    except: return default
+
+def safe_str(key, info_dict, default="N/A"):
+    v = info_dict.get(key)
+    return str(v) if v and not pd.isna(v) else default
+
+# === 6. 主程序 ===
 if __name__ == "__main__":
     st.markdown('<div class="report-container">', unsafe_allow_html=True)
     
-    if 'run_analysis' not in st.session_state:
-        st.session_state.run_analysis = False
-    if 'retry_count' not in st.session_state:
-        st.session_state.retry_count = 0
+    if 'run_analysis' not in st.session_state: st.session_state.run_analysis = False
 
     with st.sidebar:
         st.header("🔍 查詢設置")
         ticker_input = st.text_input("股票代碼", value="AAPL", placeholder="例如：AAPL, 09988.HK, TSM")
         if st.button("🚀 開始深度分析", type="primary", use_container_width=True):
             st.session_state.run_analysis = True
-            st.session_state.retry_count = 0
         if st.button("🔄 重新載入（清除緩存）", use_container_width=True):
             st.cache_data.clear()
             st.session_state.run_analysis = False
@@ -177,7 +176,7 @@ if __name__ == "__main__":
     if st.session_state.run_analysis and ticker_input.strip():
         ticker = ticker_input.strip().upper()
         with st.spinner("🔍 正在獲取數據與生成報告..."):
-            df, info, news_data, error = fetch_stock_data(ticker)
+            df, info, error = fetch_stock_data(ticker)
             
             if error:
                 st.error(error)
@@ -205,23 +204,20 @@ if __name__ == "__main__":
                 macd_val, sig_val = df['MACD'].iloc[-1], df['Signal'].iloc[-1]
                 rsi_val = df['RSI'].iloc[-1]
                 sma20, sma50, sma200 = df['SMA20'].iloc[-1], df['SMA50'].iloc[-1], df['SMA200'].iloc[-1]
-                fib_pos = ((current_price - recent_low) / drop_range) * 100
+                fib_pos = ((current_price - recent_low) / drop_range) * 100 if drop_range > 0 else 0
                 
                 vix_val, spy_chg = get_market_context()
                 sentiment = get_sentiment(df, current_price, df['SMA20'], vix_val, spy_chg)
                 
-                def safe_get(k, d="N/A"):
-                    try:
-                        v = info.get(k)
-                        return v if v is not None and not pd.isna(v) else d
-                    except: return d
-                
-                sector, industry = safe_get('sector'), safe_get('industry')
-                gross_margin = safe_get('grossMargins')
-                roe = safe_get('returnOnEquity')
-                pe = safe_get('trailingPE')
-                rev_growth = safe_get('revenueGrowth')
-                mcap = safe_get('marketCap')
+                # 🔑 使用 safe_float/safe_str 徹底解決 TypeError
+                sector = safe_str('sector', info)
+                industry = safe_str('industry', info)
+                gross_margin = safe_float('grossMargins', info)
+                roe = safe_float('returnOnEquity', info)
+                pe = safe_float('trailingPE', info)
+                rev_growth = safe_float('revenueGrowth', info)
+                mcap = safe_float('marketCap', info)
+                company_name = safe_str('longName', info, ticker)
                 
                 ind_type, ind_pos, ind_up, ind_down = analyze_industry(sector, industry, gross_margin, roe)
                 
@@ -245,10 +241,11 @@ if __name__ == "__main__":
                 sl_long = s3 * 0.95
                 tp1, tp2, tp3 = r1 * 0.99, r2 * 0.98, r3 * 0.97
                 
+                # 🔑 安全比較邏輯 (ro e/pe 已保證為 float)
                 rating_sc = 0
-                if roe and roe > 0.15: rating_sc += 2
-                if rev_growth and rev_growth > 0.15: rating_sc += 2
-                if pe and 10 < pe < 30: rating_sc += 1
+                if roe > 0.15: rating_sc += 2
+                if rev_growth > 0.15: rating_sc += 2
+                if 0 < pe < 30: rating_sc += 1
                 if current_price > sma200: rating_sc += 1
                 if sentiment['score'] >= 60: rating_sc += 1
                 rating_txt = "🟢 強烈買入" if rating_sc >= 6 else "🟡 買入/增持" if rating_sc >= 4 else "🟠 持有/觀望" if rating_sc >= 2 else "🔴 減持/規避"
@@ -267,7 +264,7 @@ if __name__ == "__main__":
                  <div class="section-card">
                      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
                          <div>
-                             <h2 style="margin:0; font-size:1.5rem;">{safe_get('longName', ticker)} ({ticker})</h2>
+                             <h2 style="margin:0; font-size:1.5rem;">{company_name} ({ticker})</h2>
                              <span style="color:#6b7280; font-size:0.9rem;">數據基準：{last_date} 收盤</span>
                          </div>
                          <div style="text-align:right;">
@@ -325,10 +322,10 @@ if __name__ == "__main__":
                 """, unsafe_allow_html=True)
                 st.markdown('</div>', unsafe_allow_html=True)
 
-                roe_txt = "✅ 優秀 (>15%)" if roe and roe > 0.15 else "⚠️ 一般" if roe else "N/A"
-                grow_txt = "🚀 高速 (>20%)" if rev_growth and rev_growth > 0.2 else "📈 穩健" if rev_growth and rev_growth > 0.1 else "🐢 放緩" if rev_growth else "N/A"
-                margin_txt = "💰 高毛利 (>50%)" if gross_margin and gross_margin > 0.5 else "🏭 標準" if gross_margin else "N/A"
-                pe_txt = "💸 高估值" if pe and pe > 40 else "⚖️ 合理" if pe and 15 < pe < 40 else "💰 低估值" if pe and pe < 15 else "N/A"
+                roe_txt = "✅ 優秀 (>15%)" if roe > 0.15 else "⚠️ 一般" if roe > 0 else "N/A"
+                grow_txt = "🚀 高速 (>20%)" if rev_growth > 0.2 else "📈 穩健" if rev_growth > 0.1 else "🐢 放緩" if rev_growth > 0 else "N/A"
+                margin_txt = "💰 高毛利 (>50%)" if gross_margin > 0.5 else "🏭 標準" if gross_margin > 0 else "N/A"
+                pe_txt = "💸 高估值" if pe > 40 else "⚖️ 合理" if 15 < pe < 40 else "💰 低估值" if 0 < pe < 15 else "N/A"
                 
                 st.markdown('<div class="section-card"><div class="section-title">6. 財報指標與投資評級</div>', unsafe_allow_html=True)
                 st.markdown(f"""
