@@ -2,12 +2,10 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import datetime
 import time
-from functools import wraps
 import plotly.graph_objects as go
 
-# === 1. 頁面配置 ===
+# === 1. 頁面配置與全局樣式 ===
 st.set_page_config(page_title="股票深度分析報告", page_icon="📊", layout="wide")
 st.markdown("""
     <style>
@@ -20,18 +18,33 @@ st.markdown("""
     .metric-value { font-size: 1.1rem; font-weight: 600; color: #111827; }
     .tag-green { color: #059669; font-weight: 600; }
     .tag-red { color: #dc2626; font-weight: 600; }
-    .tag-orange { color: #d97706; font-weight: 600; }
     hr { border-top: 1px solid #e5e7eb; margin: 20px 0; }
     #MainMenu, footer, header { visibility: hidden; }
     </style>
 """, unsafe_allow_html=True)
 
-# === 2. 緩存與數據獲取（抗限流+型別安全） ===
+# === 2. 安全型別提取器 (防 AttributeError & TypeError) ===
+def safe_get(info_dict, key, default=None):
+    if not isinstance(info_dict, dict): return default
+    v = info_dict.get(key)
+    return None if v is None or (isinstance(v, float) and pd.isna(v)) else v
+
+def safe_float(info_dict, key, default=0.0):
+    v = safe_get(info_dict, key)
+    if v is None: return default
+    try: return float(v)
+    except: return default
+
+def safe_str(info_dict, key, default="N/A"):
+    v = safe_get(info_dict, key)
+    return str(v) if v else default
+
+# === 3. 緩存與數據獲取 ===
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_market_context():
     try:
         vix = yf.Ticker("^VIX").history(period="1d", interval="1d")
-        time.sleep(0.8)
+        time.sleep(0.5)
         spy = yf.Ticker("^GSPC").history(period="5d", interval="1d")
         vix_val = vix['Close'].iloc[-1] if not vix.empty else 20
         spy_chg = ((spy['Close'].iloc[-1] - spy['Close'].iloc[-2]) / spy['Close'].iloc[-2]) * 100 if len(spy) >= 2 else 0
@@ -43,33 +56,31 @@ def fetch_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
         df = stock.history(period="2y", interval="1d")
-        time.sleep(0.6)
-        if df.empty or len(df) < 30: return None, None, "數據不足或代碼錯誤"
+        time.sleep(0.4)
+        if df.empty or len(df) < 30: return None, {}, "數據不足或代碼無效"
         
+        # 清理欄位名 (兼容 yfinance 多索引/後綴)
         df.columns = [str(c).lower().split('_')[0] for c in df.columns]
-        if 'close' not in df.columns: return None, None, "無法解析收盤價欄位"
+        if 'close' not in df.columns: return None, {}, "無法解析收盤價欄位"
         
+        # 穩健獲取 info
         info = {}
         for attempt in range(3):
             try:
-                info = stock.info
-                if info and 'sector' in info: break
+                raw_info = stock.info
+                if isinstance(raw_info, dict) and 'sector' in raw_info:
+                    info = raw_info; break
                 time.sleep(1.5 * (attempt + 1))
-            except Exception: time.sleep(2 ** attempt)
+            except: time.sleep(2 ** attempt)
             
-        news_data = []
-        try:
-            time.sleep(0.5)
-            news_data = getattr(stock, 'news', []) or []
-        except: pass
         return df, info, None
     except Exception as e:
         err = str(e)
         if "Too Many Requests" in err or "Rate limited" in err:
-            return None, None, "⚠️ Yahoo Finance 請求過於頻繁，請稍候 1~2 分鐘後重試。"
-        return None, None, f"數據獲取失敗：{err}"
+            return None, {}, "⚠️ Yahoo Finance 請求頻繁，請等候 60 秒後重試。"
+        return None, {}, f"數據獲取失敗：{err}"
 
-# === 3. 技術指標計算 ===
+# === 4. 技術指標計算 ===
 @st.cache_data
 def calc_indicators(df):
     df = df.copy()
@@ -88,7 +99,7 @@ def calc_indicators(df):
     df['SMA200'] = df['close'].rolling(200, min_periods=1).mean()
     return df
 
-# === 4. 圖表生成 ===
+# === 5. 圖表生成 ===
 def generate_chart(df, fib_levels):
     plot_df = df.tail(252).copy()
     if plot_df.empty: return None
@@ -111,7 +122,7 @@ def generate_chart(df, fib_levels):
     fig.update_yaxes(showgrid=True, gridcolor='#e5e7eb', gridwidth=0.5)
     return fig
 
-# === 5. 市場情緒與行業分析 ===
+# === 6. 市場情緒與行業分析 ===
 def get_sentiment(df, current_price, sma20, vix_val, spy_chg):
     tech = "🟢 多頭" if current_price > sma20.iloc[-1] else "🔴 空頭"
     vol = df['volume'].iloc[-1]
@@ -145,18 +156,7 @@ def analyze_industry(sector, industry, gross_margin, roe):
         return "資金密集型", "服務中介", "弱勢 (資金成本)", "中等"
     return "一般行業", "中游", "中等", "中等"
 
-# === 🔑 核心修復：安全數值提取器 (防 TypeError) ===
-def safe_float(key, info_dict, default=0.0):
-    v = info_dict.get(key)
-    if v is None or pd.isna(v): return default
-    try: return float(v)
-    except: return default
-
-def safe_str(key, info_dict, default="N/A"):
-    v = info_dict.get(key)
-    return str(v) if v and not pd.isna(v) else default
-
-# === 6. 主程序 ===
+# === 7. 主程序 ===
 if __name__ == "__main__":
     st.markdown('<div class="report-container">', unsafe_allow_html=True)
     
@@ -209,15 +209,15 @@ if __name__ == "__main__":
                 vix_val, spy_chg = get_market_context()
                 sentiment = get_sentiment(df, current_price, df['SMA20'], vix_val, spy_chg)
                 
-                # 🔑 使用 safe_float/safe_str 徹底解決 TypeError
-                sector = safe_str('sector', info)
-                industry = safe_str('industry', info)
-                gross_margin = safe_float('grossMargins', info)
-                roe = safe_float('returnOnEquity', info)
-                pe = safe_float('trailingPE', info)
-                rev_growth = safe_float('revenueGrowth', info)
-                mcap = safe_float('marketCap', info)
-                company_name = safe_str('longName', info, ticker)
+                # 🔑 徹底解決 AttributeError/TypeError
+                sector = safe_str(info, 'sector')
+                industry = safe_str(info, 'industry')
+                gross_margin = safe_float(info, 'grossMargins')
+                roe = safe_float(info, 'returnOnEquity')
+                pe = safe_float(info, 'trailingPE')
+                rev_growth = safe_float(info, 'revenueGrowth')
+                mcap = safe_float(info, 'marketCap')
+                company_name = safe_str(info, 'longName', ticker)
                 
                 ind_type, ind_pos, ind_up, ind_down = analyze_industry(sector, industry, gross_margin, roe)
                 
@@ -241,7 +241,6 @@ if __name__ == "__main__":
                 sl_long = s3 * 0.95
                 tp1, tp2, tp3 = r1 * 0.99, r2 * 0.98, r3 * 0.97
                 
-                # 🔑 安全比較邏輯 (ro e/pe 已保證為 float)
                 rating_sc = 0
                 if roe > 0.15: rating_sc += 2
                 if rev_growth > 0.15: rating_sc += 2
