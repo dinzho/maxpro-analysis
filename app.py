@@ -23,7 +23,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# === 2. 安全型別提取器 (防 AttributeError & TypeError) ===
+# === 2. 絕對安全型別提取器 (防 AttributeError) ===
 def safe_get(info_dict, key, default=None):
     if not isinstance(info_dict, dict): return default
     v = info_dict.get(key)
@@ -39,7 +39,7 @@ def safe_str(info_dict, key, default="N/A"):
     v = safe_get(info_dict, key)
     return str(v) if v else default
 
-# === 3. 緩存與數據獲取 ===
+# === 3. 緩存與數據獲取 (抗限流+型別隔離) ===
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_market_context():
     try:
@@ -63,12 +63,12 @@ def fetch_stock_data(ticker):
         df.columns = [str(c).lower().split('_')[0] for c in df.columns]
         if 'close' not in df.columns: return None, {}, "無法解析收盤價欄位"
         
-        # 穩健獲取 info
+        # 穩健獲取 info (永遠回傳 dict)
         info = {}
         for attempt in range(3):
             try:
                 raw_info = stock.info
-                if isinstance(raw_info, dict) and 'sector' in raw_info:
+                if isinstance(raw_info, dict) and len(raw_info) > 0:
                     info = raw_info; break
                 time.sleep(1.5 * (attempt + 1))
             except: time.sleep(2 ** attempt)
