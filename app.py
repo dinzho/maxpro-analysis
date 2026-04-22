@@ -2,15 +2,12 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import datetime
 import time
-from functools import wraps
 import plotly.graph_objects as go
+from datetime import datetime
 
-# === 1. 頁面配置 ===
+# === 頁面配置與樣式 ===
 st.set_page_config(page_title="股票深度分析報告", page_icon="📊", layout="wide")
-
-# === 2. 全局樣式配置 ===
 st.markdown("""
     <style>
     .report-container { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; color: #1f2937; line-height: 1.6; }
@@ -22,42 +19,65 @@ st.markdown("""
     .metric-value { font-size: 1.1rem; font-weight: 600; color: #111827; }
     .tag-green { color: #059669; font-weight: 600; }
     .tag-red { color: #dc2626; font-weight: 600; }
-    .tag-orange { color: #d97706; font-weight: 600; }
     hr { border-top: 1px solid #e5e7eb; margin: 20px 0; }
     #MainMenu, footer, header { visibility: hidden; }
     </style>
 """, unsafe_allow_html=True)
 
-# === 3. 緩存與數據獲取 ===
-@st.cache_data(ttl=3600)
+# === 緩存與數據獲取（抗限流強化） ===
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_market_context():
+    """獨立獲取大盤與情緒指標，避免與個股請求衝突"""
+    try:
+        vix = yf.Ticker("^VIX").history(period="1d", interval="1d")
+        time.sleep(0.8)
+        spy = yf.Ticker("^GSPC").history(period="5d", interval="1d")
+        vix_val = vix['Close'].iloc[-1] if not vix.empty else 20
+        spy_chg = ((spy['Close'].iloc[-1] - spy['Close'].iloc[-2]) / spy['Close'].iloc[-2]) * 100 if len(spy) >= 2 else 0
+        return vix_val, spy_chg
+    except:
+        return 20, 0
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_stock_data(ticker):
+    """帶重試機制的穩健數據獲取"""
     try:
         stock = yf.Ticker(ticker)
         df = stock.history(period="2y", interval="1d")
-        if df.empty or len(df) < 30:
-            return None, None, None, None, None, "數據不足或代碼錯誤，請檢查股票代碼。"
+        time.sleep(0.6)
         
-        # 清理欄位名 (兼容 yfinance 多索引或後綴)
+        if df.empty or len(df) < 30:
+            return None, None, None, None, "數據不足或代碼錯誤"
+            
+        # 清理欄位名
         df.columns = [str(c).lower().split('_')[0] for c in df.columns]
         if 'close' not in df.columns:
-            return None, None, None, None, None, "無法解析收盤價欄位。"
+            return None, None, None, None, "無法解析收盤價欄位"
             
-        # 獲取基本面與新聞 (帶重試)
+        # 基本面獲取（帶重試）
         info = {}
-        for _ in range(3):
+        for attempt in range(3):
             try:
                 info = stock.info
                 if info and 'sector' in info: break
-                time.sleep(1)
-            except: time.sleep(1)
+                time.sleep(1.5 * (attempt + 1))
+            except Exception:
+                time.sleep(2 ** attempt)
                 
-        news_data = getattr(stock, 'news', []) or []
-        recommendations = getattr(stock, 'recommendations', None)
-        return stock, df, info, news_data, recommendations, None
+        news_data = []
+        try:
+            time.sleep(0.5)
+            news_data = getattr(stock, 'news', []) or []
+        except: pass
+            
+        return df, info, news_data, None
     except Exception as e:
-        return None, None, None, None, None, f"數據獲取失敗：{str(e)}"
+        err = str(e)
+        if "Too Many Requests" in err or "Rate limited" in err:
+            return None, None, None, "⚠️ Yahoo Finance 請求過於頻繁，請稍候 1~2 分鐘後點擊下方「重試」按鈕。"
+        return None, None, None, f"數據獲取失敗：{err}"
 
-# === 4. 技術指標計算 ===
+# === 技術指標計算 ===
 @st.cache_data
 def calc_indicators(df):
     df = df.copy()
@@ -65,7 +85,6 @@ def calc_indicators(df):
     exp2 = df['close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = exp1 - exp2
     df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    df['Histogram'] = df['MACD'] - df['Signal']
     
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14, min_periods=1).mean()
@@ -77,7 +96,7 @@ def calc_indicators(df):
     df['SMA200'] = df['close'].rolling(200, min_periods=1).mean()
     return df
 
-# === 5. 圖表生成 ===
+# === 圖表生成 ===
 def generate_chart(df, fib_levels):
     plot_df = df.tail(252).copy()
     if plot_df.empty: return None
@@ -100,22 +119,14 @@ def generate_chart(df, fib_levels):
     fig.update_yaxes(showgrid=True, gridcolor='#e5e7eb', gridwidth=0.5)
     return fig
 
-# === 6. 市場情緒與行業分析 ===
-def get_sentiment(df, current_price, sma20, recent_low):
+# === 市場情緒與行業分析 ===
+def get_sentiment(df, current_price, sma20, vix_val, spy_chg):
     tech = "🟢 多頭" if current_price > sma20.iloc[-1] else "🔴 空頭"
     vol = df['volume'].iloc[-1]
     avg_vol = df['volume'].rolling(10, min_periods=1).mean().iloc[-1]
     vol_chg = ((vol / avg_vol - 1) * 100) if avg_vol > 0 else 0
     vol_str = f"📈 放量 (+{vol_chg:.0f}%)" if vol_chg > 20 else f"📉 縮量 ({vol_chg:.0f}%)" if vol_chg < -20 else "➡️ 平量"
     
-    try:
-        vix = yf.Ticker("^VIX").history(period="1d", interval="1d")
-        vix_val = vix['Close'].iloc[-1] if not vix.empty else 20
-        spy = yf.Ticker("^GSPC").history(period="5d", interval="1d")
-        spy_chg = ((spy['Close'].iloc[-1] - spy['Close'].iloc[-2]) / spy['Close'].iloc[-2]) * 100 if len(spy) >= 2 else 0
-    except:
-        vix_val, spy_chg = 20, 0
-        
     vix_mood = "😰 恐慌" if vix_val > 30 else "😟 謹慎" if vix_val > 25 else "😌 樂觀" if vix_val < 18 else "😐 中性"
     stock_chg = ((current_price - df['close'].iloc[-2]) / df['close'].iloc[-2]) * 100 if len(df) > 1 else 0
     rel = "🟢 強於大盤" if stock_chg > spy_chg + 2 else "🔴 弱於大盤" if stock_chg < spy_chg - 2 else "🟡 同步大盤"
@@ -142,24 +153,36 @@ def analyze_industry(sector, industry, gross_margin, roe):
         return "資金密集型", "服務中介", "弱勢 (資金成本)", "中等"
     return "一般行業", "中游", "中等", "中等"
 
-# === 7. 主程序 ===
+# === 主程序 ===
 if __name__ == "__main__":
     st.markdown('<div class="report-container">', unsafe_allow_html=True)
     
+    if 'run_analysis' not in st.session_state:
+        st.session_state.run_analysis = False
+    if 'retry_count' not in st.session_state:
+        st.session_state.retry_count = 0
+
     with st.sidebar:
         st.header("🔍 查詢設置")
         ticker_input = st.text_input("股票代碼", value="AAPL", placeholder="例如：AAPL, 09988.HK, TSM")
-        analyze_btn = st.button("🚀 開始深度分析", type="primary", use_container_width=True)
+        if st.button("🚀 開始深度分析", type="primary", use_container_width=True):
+            st.session_state.run_analysis = True
+            st.session_state.retry_count = 0
+        if st.button("🔄 重新載入（清除緩存）", use_container_width=True):
+            st.cache_data.clear()
+            st.session_state.run_analysis = False
         st.markdown("---")
-        st.info("💡 數據來源：Yahoo Finance | 延遲約15分鐘")
+        st.info("💡 Yahoo Finance 有請求頻率限制，建議間隔 10 秒以上查詢不同代碼。")
 
-    if analyze_btn and ticker_input.strip():
+    if st.session_state.run_analysis and ticker_input.strip():
         ticker = ticker_input.strip().upper()
-        with st.spinner("🔍 正在生成深度報告..."):
-            stock, df, info, news_data, recommendations, error = fetch_stock_data(ticker)
+        with st.spinner("🔍 正在獲取數據與生成報告..."):
+            df, info, news_data, error = fetch_stock_data(ticker)
             
             if error:
-                st.error(f"❌ {error}")
+                st.error(error)
+                if "Too Many Requests" in error:
+                    st.warning("🕒 系統已自動冷卻。請稍候後點擊左側「重新載入」或刷新頁面。")
             else:
                 df = calc_indicators(df)
                 current_price = df['close'].iloc[-1]
@@ -184,7 +207,8 @@ if __name__ == "__main__":
                 sma20, sma50, sma200 = df['SMA20'].iloc[-1], df['SMA50'].iloc[-1], df['SMA200'].iloc[-1]
                 fib_pos = ((current_price - recent_low) / drop_range) * 100
                 
-                sentiment = get_sentiment(df, current_price, df['SMA20'], recent_low)
+                vix_val, spy_chg = get_market_context()
+                sentiment = get_sentiment(df, current_price, df['SMA20'], vix_val, spy_chg)
                 
                 def safe_get(k, d="N/A"):
                     try:
@@ -393,5 +417,5 @@ if __name__ == "__main__":
                 st.markdown('<hr><div style="text-align:center; color:#6b7280; font-size:0.85rem;">⚠️ 免責聲明：本報告僅供參考，不構成投資建議。市場有風險，決策需謹慎。</div>', unsafe_allow_html=True)
                 st.markdown('</div>', unsafe_allow_html=True)
 
-    elif not analyze_btn:
+    elif not st.session_state.run_analysis:
         st.info("👈 請在左側輸入股票代碼並點擊「開始深度分析」")
