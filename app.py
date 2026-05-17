@@ -23,24 +23,21 @@ hr { border-top: 1px solid #e5e7eb; margin: 20px 0; }
 </style>
 """, unsafe_allow_html=True)
 
-# === 2. 絕對安全型別提取器 (防 AttributeError/None) ===
+# === 2. 絕對安全型別提取器 ===
 def safe_get(info_dict, key, default=None):
     if not isinstance(info_dict, dict): return default
     v = info_dict.get(key)
     return None if v is None or (isinstance(v, float) and pd.isna(v)) else v
 
-def safe_float(info_dict, key):
-    """回傳 float 或 None，不預設 0.0 以免干擾判斷"""
+def safe_float(info_dict, key, default=0.0):
     v = safe_get(info_dict, key)
-    if v is None: return None
-    try: return float(v)
-    except: return None
+    return default if v is None else float(v)
 
 def safe_str(info_dict, key, default="暫缺"):
     v = safe_get(info_dict, key)
     return str(v) if v else default
 
-# === 3. 緩存與數據獲取 (抗限流+型別隔離) ===
+# === 3. 緩存與數據獲取 ===
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_market_context():
     try:
@@ -61,24 +58,20 @@ def fetch_stock_data(ticker):
         time.sleep(0.4)
         if df.empty or len(df) < 30:
             return None, {}, "數據不足或代碼無效"
-        
-        # 清理欄位名 (兼容 yfinance 多索引/後綴)
         df.columns = [str(c).lower().split('_')[0] for c in df.columns]
         if 'close' not in df.columns:
             return None, {}, "無法解析收盤價欄位"
         
-        # 穩健獲取 info (永遠回傳 dict)
         info = {}
         for attempt in range(3):
             try:
                 raw_info = stock.info
-                if isinstance(raw_info, dict) and len(raw_info) > 5:  # 確保不是空殼字典
+                if isinstance(raw_info, dict) and len(raw_info) > 5:
                     info = raw_info
                     break
                 time.sleep(1.5 * (attempt + 1))
             except:
                 time.sleep(2 ** attempt)
-                
         return df, info, None
     except Exception as e:
         err = str(e)
@@ -162,8 +155,7 @@ def analyze_industry(sector, industry, gross_margin, roe):
 # === 7. 主程序 ===
 if __name__ == "__main__":
     st.markdown('<div class="report-container">', unsafe_allow_html=True)
-    if 'run_analysis' not in st.session_state:
-        st.session_state.run_analysis = False
+    if 'run_analysis' not in st.session_state: st.session_state.run_analysis = False
 
     with st.sidebar:
         st.header("🔍 查詢設置")
@@ -183,8 +175,6 @@ if __name__ == "__main__":
             
             if error:
                 st.error(error)
-                if "Too Many Requests" in error:
-                    st.warning("🕒 系統已自動冷卻。請稍候後點擊左側「重新載入」或刷新頁面。")
             else:
                 df = calc_indicators(df)
                 current_price = df['close'].iloc[-1]
@@ -212,7 +202,6 @@ if __name__ == "__main__":
                 vix_val, spy_chg = get_market_context()
                 sentiment = get_sentiment(df, current_price, df['SMA20'], vix_val, spy_chg)
                 
-                # 🔑 安全提取基本面數據
                 sector = safe_str(info, 'sector')
                 industry = safe_str(info, 'industry')
                 gross_margin = safe_float(info, 'grossMargins')
@@ -244,11 +233,10 @@ if __name__ == "__main__":
                 sl_long = s3 * 0.95
                 tp1, tp2, tp3 = r1 * 0.99, r2 * 0.98, r3 * 0.97
                 
-                # 評級計算：僅在數據存在時加分
                 rating_sc = 0
-                if roe is not None and roe > 0.15: rating_sc += 2
-                if rev_growth is not None and rev_growth > 0.15: rating_sc += 2
-                if pe is not None and 0 < pe < 30: rating_sc += 1
+                if roe > 0.15: rating_sc += 2
+                if rev_growth > 0.15: rating_sc += 2
+                if 0 < pe < 30: rating_sc += 1
                 if current_price > sma200: rating_sc += 1
                 if sentiment['score'] >= 60: rating_sc += 1
                 rating_txt = "🟢 強烈買入" if rating_sc >= 6 else "🟡 買入/增持" if rating_sc >= 4 else "🟠 持有/觀望" if rating_sc >= 2 else "🔴 減持/規避"
@@ -262,7 +250,6 @@ if __name__ == "__main__":
                 risk_sc = max(0, min(100, risk_sc))
                 risk_txt = "； ".join(risk_reasons) if risk_reasons else "指標中性"
 
-                # === 渲染區塊 ===
                 st.markdown(f"""
                   <div class="section-card">
                       <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
@@ -276,7 +263,7 @@ if __name__ == "__main__":
                           </div>
                       </div>
                       <div style="margin-top:8px; color:#4b5563; font-size:0.95rem;">
-                        52周範圍：${low_52w:.2f} - ${high_52w:.2f}  &nbsp;| &nbsp; 市值：${mcap/1e9:.2f if mcap else 0}B
+                        52周範圍：${low_52w:.2f} - ${high_52w:.2f}  &nbsp;| &nbsp; 市值：${mcap/1e9:.2f}B
                       </div>
                   </div>
                  """, unsafe_allow_html=True)
@@ -314,7 +301,6 @@ if __name__ == "__main__":
                  """, unsafe_allow_html=True)
                 st.markdown('</div>', unsafe_allow_html=True)
 
-                # === 修正 1: 基本面分析區塊 (安全容錯) ===
                 st.markdown('<div class="section-card"><div class="section-title">5. 基本面分析</div>', unsafe_allow_html=True)
                 st.markdown(f"""
                   <ul style="margin:0; padding-left:20px; color:#374151;">
@@ -326,23 +312,19 @@ if __name__ == "__main__":
                  """, unsafe_allow_html=True)
                 st.markdown('</div>', unsafe_allow_html=True)
 
-                # === 修正 2: 財報指標與投資評級區塊 (安全格式化) ===
-                def fmt_pct(val): return f"{val*100:.1f}%" if val is not None else "📊 數據暫缺"
-                def fmt_pe(val): return f"{val:.1f}x" if val is not None else "📊 數據暫缺"
-                
-                roe_txt = "✅ 優秀 (>15%)" if roe is not None and roe > 0.15 else ("⚠️ 一般" if roe is not None and roe > 0 else "📊 數據暫缺")
-                grow_txt = "🚀 高速 (>20%)" if rev_growth is not None and rev_growth > 0.2 else ("📈 穩健" if rev_growth is not None and rev_growth > 0.1 else ("🐢 放緩" if rev_growth is not None and rev_growth > 0 else "📊 數據暫缺"))
-                margin_txt = "💰 高毛利 (>50%)" if gross_margin is not None and gross_margin > 0.5 else ("🏭 標準" if gross_margin is not None and gross_margin > 0 else "📊 數據暫缺")
-                pe_txt = "💸 高估值" if pe is not None and pe > 40 else ("⚖️ 合理" if pe is not None and 15 < pe < 40 else ("💰 低估值" if pe is not None and 0 < pe < 15 else "📊 數據暫缺"))
+                roe_txt = "✅ 優秀 (>15%)" if roe > 0.15 else "⚠️ 一般" if roe > 0 else "📊 數據暫缺"
+                grow_txt = "🚀 高速 (>20%)" if rev_growth > 0.2 else "📈 穩健" if rev_growth > 0.1 else "🐢 放緩" if rev_growth > 0 else "📊 數據暫缺"
+                margin_txt = "💰 高毛利 (>50%)" if gross_margin > 0.5 else "🏭 標準" if gross_margin > 0 else "📊 數據暫缺"
+                pe_txt = "💸 高估值" if pe > 40 else "⚖️ 合理" if 15 < pe < 40 else "💰 低估值" if 0 < pe < 15 else "📊 數據暫缺"
                 
                 st.markdown('<div class="section-card"><div class="section-title">6. 財報指標與投資評級</div>', unsafe_allow_html=True)
                 st.markdown(f"""
                   <table style="width:100%; border-collapse:collapse; margin-bottom:12px;">
                       <tr style="background:#f9fafb;"><th style="padding:8px; text-align:left; border-bottom:1px solid #e5e7eb;">指標</th><th style="padding:8px; text-align:left; border-bottom:1px solid #e5e7eb;">數值</th><th style="padding:8px; text-align:left; border-bottom:1px solid #e5e7eb;">評估</th></tr>
-                      <tr><td style="padding:8px; border-bottom:1px solid #f3f4f6;">ROE</td><td style="padding:8px; border-bottom:1px solid #f3f4f6;">{fmt_pct(roe)}</td><td style="padding:8px; border-bottom:1px solid #f3f4f6;">{roe_txt}</td></tr>
-                      <tr><td style="padding:8px; border-bottom:1px solid #f3f4f6;">營收增長</td><td style="padding:8px; border-bottom:1px solid #f3f4f6;">{fmt_pct(rev_growth)}</td><td style="padding:8px; border-bottom:1px solid #f3f4f6;">{grow_txt}</td></tr>
-                      <tr><td style="padding:8px; border-bottom:1px solid #f3f4f6;">毛利率</td><td style="padding:8px; border-bottom:1px solid #f3f4f6;">{fmt_pct(gross_margin)}</td><td style="padding:8px; border-bottom:1px solid #f3f4f6;">{margin_txt}</td></tr>
-                      <tr><td style="padding:8px; border-bottom:1px solid #f3f4f6;">PE (TTM)</td><td style="padding:8px; border-bottom:1px solid #f3f4f6;">{fmt_pe(pe)}</td><td style="padding:8px; border-bottom:1px solid #f3f4f6;">{pe_txt}</td></tr>
+                      <tr><td style="padding:8px; border-bottom:1px solid #f3f4f6;">ROE</td><td style="padding:8px; border-bottom:1px solid #f3f4f6;">{roe*100:.1f}%</td><td style="padding:8px; border-bottom:1px solid #f3f4f6;">{roe_txt}</td></tr>
+                      <tr><td style="padding:8px; border-bottom:1px solid #f3f4f6;">營收增長</td><td style="padding:8px; border-bottom:1px solid #f3f4f6;">{rev_growth*100:.1f}%</td><td style="padding:8px; border-bottom:1px solid #f3f4f6;">{grow_txt}</td></tr>
+                      <tr><td style="padding:8px; border-bottom:1px solid #f3f4f6;">毛利率</td><td style="padding:8px; border-bottom:1px solid #f3f4f6;">{gross_margin*100:.1f}%</td><td style="padding:8px; border-bottom:1px solid #f3f4f6;">{margin_txt}</td></tr>
+                      <tr><td style="padding:8px; border-bottom:1px solid #f3f4f6;">PE (TTM)</td><td style="padding:8px; border-bottom:1px solid #f3f4f6;">{pe:.1f}x</td><td style="padding:8px; border-bottom:1px solid #f3f4f6;">{pe_txt}</td></tr>
                   </table>
                   <div style="background:#f0fdf4; padding:10px; border-radius:6px; border-left:4px solid #10b981;">
                       <b>🏆 投資評級：{rating_txt}</b> (評分 {rating_sc}/7)<br>
